@@ -1,0 +1,460 @@
+"""
+    take one real day as a sample
+    make list of couriers ever responded to the orders those day:
+    time of first response, time of last response + 1 hour - those are courier available working ttime
+    coordinates, list of points to visit
+    make list of orders those day: order parameters, points with arival windows
+    life is between 6:00 and 6:00 of the next day
+
+    case 1:
+      try to assign order as soon as it is approved
+      add order route either to the begiining or to the end of courier current route
+    case 2:
+      try to assign order 1 hour before from_dt
+      add ordr route either to the begiining or to the end of courier current route
+    case 3:
+      try to assign order 1 hour before from_dt
+      mix addresses of order route with addresses of courier current route
+
+    compare: earnings per hour, ...
+
+"""
+
+import csv
+from math import degrees, radians, sin, cos, acos, sqrt
+from datetime import datetime, timedelta
+from graphics import *
+from orders_combinations import Tree
+
+# string datetime to datetime
+def dt(dt_str):
+  return datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+
+# constants
+checkin_time = 0.25 # 0.25 hour = 15 minutes
+avg_speed = 20.0 # km/h
+minLat = 55.558728
+maxLat = 55.930557
+minLon = 37.320360
+maxLon = 37.913622
+day_start_dt = dt('2017-10-19 06:00:00')
+day_end_dt   = dt('2017-10-20 06:00:00')
+
+# global variables
+cursor_time_dt = dt('2017-10-19 06:00:00')
+prev_cursor_time_dt = cursor_time_dt
+orders = {}
+couriers = {}
+
+graphics_on = False
+
+cando_prevent_count = 0
+
+# distance in km
+def distance(lat1, lon1, lat2, lon2):
+  return sqrt(((lat1 - lat2) * 111) ** 2 + ((lon1 - lon2) * 63.5) ** 2)
+
+# dutation in hours
+def duration(lat1, lon1, lat2, lon2):
+  return sqrt(((lat1 - lat2) * 111) ** 2 + ((lon1 - lon2) * 63.5) ** 2) / avg_speed + checkin_time # divided by speed and added checkin time spent at the point
+
+def lat_to_y(lat):
+  return 720 - int((lat - minLat) / (maxLat - minLat) * 720)
+
+def lon_to_x(lon):
+  return int((lon - minLon) / (maxLon - minLon) * 651)
+
+def update_route_durations(a_route):
+  for k in range(1, len(a_route)):
+    a_route[k]['dur'] = duration(a_route[k-1]['addr'].latitude, a_route[k-1]['addr'].longitude, a_route[k]['addr'].latitude, a_route[k]['addr'].longitude)
+
+class Address(object):
+  def __init__(self, a_latitude, a_longitude, a_from, a_to):
+    self.latitude = a_latitude
+    self.longitude = a_longitude
+    self.from_dt = a_from
+    self.to_dt = a_to
+
+class Route(object):
+  def __init__(self):
+    self.addr_list = []
+    self.total_duration = 0.0
+
+  def append_address(self, a_address):
+    self.addr_list.append(a_address)
+
+class Order(object):
+  def __init__(self, a_order_id, a_approve_dt):
+    self.order_id = a_order_id
+    self.approve_dt = a_approve_dt
+    """ any route is a list of dict with keys 'addr' and 'dur' """
+    self.route = []
+
+  def earliest_from_dt(self):
+    return self.route[0]['addr'].from_dt
+
+  def earliest_to_dt(self):
+    return self.route[0]['addr'].to_dt
+
+  def latest_from_dt(self):
+    return max(self.route, key=lambda x: x['addr'].from_dt)['addr'].from_dt
+
+  # find good enough courier for the order, returns courier, best_route
+  # the courier is better if the increase in his worktime is smaller
+  def best_courier(self):
+    least_time_on_route = dt('2100-01-01 00:00:00')
+    least_approach_duration = 24.0
+    the_courier = None
+    the_best_route = None
+
+    for _, courier in couriers.items():
+      if courier.awake_dt > cursor_time_dt or courier.work_end_dt < cursor_time_dt:
+        continue
+      can_do, best_route, time_on_route, first_address_approach_duration = courier.yes_he_can(self.route)
+      if can_do:
+        if time_on_route < least_time_on_route:
+          least_time_on_route = time_on_route
+          least_approach_duration = first_address_approach_duration
+          the_courier, the_best_route = courier, best_route
+        elif time_on_route == least_time_on_route:
+          if first_address_approach_duration < least_approach_duration:
+            least_approach_duration = first_address_approach_duration
+            the_courier, the_best_route = courier, best_route
+
+    if the_best_route is not None:
+      the_best_route[0]['dur'] = least_approach_duration
+
+    return the_courier, the_best_route
+
+class Courier(object):
+  def __init__(self, a_courier_id, a_awake_dt, a_work_start_dt, a_work_end_dt):
+    self.courier_id = a_courier_id
+    self.awake_dt = a_awake_dt
+    self.work_start_dt = a_work_start_dt
+    self.work_end_dt = a_work_end_dt
+    self.actual_work = 0.0 # hours actually worked
+    self.assigned_work = 0.0 # hours of work already assigned
+    self.latitude = 0.0
+    self.longitude = 0.0
+    self.route = []
+    self.line_on_map = Line(Point(0,0), Point(0,0))
+    self.line_on_map.setOutline("green")
+    self.line_on_map.setArrow("last")
+
+  def assign_route(self, a_route):
+    self.route = a_route
+    route_duration = 0.0
+    for k in range(len(a_route)):
+      route_duration += a_route[k]['dur']
+    self.assigned_work = self.actual_work + route_duration
+
+
+  """ don't take into account courier.route. if courier can do a_route, return True, route_hours """
+  def can_do_route(self, a_route):
+
+    if cursor_time_dt > self.work_start_dt:
+      time_on_route_dt = cursor_time_dt
+    else:
+      time_on_route_dt = self.work_start_dt
+
+    first_address_approach_duration = None
+
+    for pi in range(len(a_route)):
+      address = a_route[pi]['addr']
+      if pi == 0:
+        approach_duration = duration(self.latitude, self.longitude, address.latitude, address.longitude)
+        first_address_approach_duration = approach_duration
+      else:
+        approach_duration = a_route[pi]['dur']
+
+      time_on_route_dt += timedelta(hours=approach_duration)
+      if time_on_route_dt > address.to_dt or time_on_route_dt > self.work_end_dt:
+        return False, day_end_dt, None
+      elif time_on_route_dt <= address.from_dt:
+        time_on_route_dt = address.from_dt
+
+    # todo - calculate route_start: earliest time when courier can start the route to finish with minimum total duration
+    return True, time_on_route_dt, first_address_approach_duration
+
+  """ if courier can be on time on the points route then return True, best route, approach duration to first address """
+  def yes_he_can(self, a_route):
+    global cando_prevent_count
+
+    # alg 1: two combinations - route1, route2 and route2, route1
+    if len(self.route) == 0:
+      can, finish_time_dt, first_address_approach_duration = self.can_do_route(a_route)
+      return can, a_route, finish_time_dt, first_address_approach_duration
+
+    a_route_dur = 0
+    for k in range(1, len(a_route)):
+      a_route_dur += a_route[k]['dur']
+
+    if ((self.work_end_dt - self.work_start_dt).total_seconds() / 3600) - self.assigned_work < a_route_dur:
+      cando_prevent_count += 1
+      return False, None, None, None
+
+    combo1 = self.route + a_route
+    update_route_durations(combo1)
+
+    combo2 = a_route + self.route
+    saved_dur = self.route[0]['dur']
+    update_route_durations(combo2)
+
+    can1, finish_time1_dt, first_address_approach_duration1 = self.can_do_route(combo1)
+    can2, finish_time2_dt, first_address_approach_duration2 = self.can_do_route(combo2)
+
+    self.route[0]['dur'] = saved_dur
+
+    if not (can1 or can2):
+      return False, None, None, None
+
+    # priorities to win: can, less time on route, less first address approach dutation
+    win1 = int(can1) * 4 + int(finish_time1_dt <= finish_time2_dt) * 2 + int(first_address_approach_duration1 <= first_address_approach_duration2)
+    win2 = int(can2) * 4 + int(finish_time2_dt <  finish_time1_dt) * 2 + int(first_address_approach_duration2 <  first_address_approach_duration1)
+
+    if win1 >= win2:
+      return True, combo1, finish_time1_dt, first_address_approach_duration1
+    else:
+      return True, combo2, finish_time2_dt, first_address_approach_duration2
+
+  """
+        # alg 2: list of all permutations
+        tree = Tree()
+        tree.buildTree(self.route, a_route)
+        route_list = tree.genRoutes()
+        for b_route in route_list:
+          b_route.update()
+          if self.can_do_route(b_route):
+            return True
+        return False
+  """
+
+  def update_on_map(self):
+    if not graphics_on:
+      return
+
+    if len(self.route) == 0:
+      self.line_on_map.undraw()
+      return
+
+    address = self.route[0]['addr']
+    if address.from_dt - timedelta(hours=self.route[0]['dur']) > cursor_time_dt:
+      return
+
+#    for address in self.route:
+    x1 = lon_to_x(self.longitude)
+    y1 = lat_to_y(self.latitude)
+
+    x2 = lon_to_x(address.longitude)
+    y2 = lat_to_y(address.latitude)
+
+    self.line_on_map.undraw()
+    self.line_on_map.p1 = Point(x1, y1)
+    self.line_on_map.p2 = Point(x2, y2)
+    self.line_on_map.draw(win)
+
+
+  def update_location(self, time_passed):
+
+    time_to_go = time_passed
+
+    while len(self.route) > 0:
+      address = self.route[0]['addr']
+      duration = self.route[0]['dur']
+      if cursor_time_dt <= address.from_dt - timedelta(hours=duration):
+        # too early to move
+        return
+      if time_to_go >= duration:
+        # get to address
+        self.latitude  = address.latitude
+        self.longitude = address.longitude
+        self.actual_work += time_to_go
+        time_to_go -= duration
+        self.route.pop(0)
+#        print "courier done the address"
+        self.update_on_map()
+      else:
+        # move towards address
+        distance_to_go = distance(self.latitude, self.longitude, address.latitude, address.longitude)
+        if distance_to_go > 0:
+          factor = min(1, time_to_go * avg_speed / distance_to_go)  # 1 means arrived and doing checkin
+          self.latitude  += (address.latitude  - self.latitude)  * factor
+          self.longitude += (address.longitude - self.longitude) * factor
+        self.route[0]['dur'] -= time_to_go
+        self.actual_work += time_to_go
+        self.update_on_map()
+        break
+
+
+# Read data
+with open('/users/mike_alexandrovski/downloads/orders.csv') as csv_file:
+  reader = csv.DictReader(csv_file)
+  for row in reader:
+    orders[row['order_id']] = Order(row['order_id'], dt(row['approve_datetime']))
+
+with open('/users/mike_alexandrovski/downloads/points.csv') as csv_file:
+  reader = csv.DictReader(csv_file)
+  for row in reader:
+    orders[row['order_id']].route.append({ 'dur': 0, 'addr': Address(float(row['latitude']), float(row['longitude']), dt(row['time_from']), dt(row['time_to']))})
+
+with open('/users/mike_alexandrovski/downloads/couriers.csv') as csv_file:
+  reader = csv.DictReader(csv_file)
+  for row in reader:
+    couriers[row['courier_id']] = Courier(row['courier_id'], dt(row['awake_time']), dt(row['work_start']), dt(row['work_end']))
+
+with open('/users/mike_alexandrovski/downloads/courier_locations.csv') as csv_file:
+  reader = csv.DictReader(csv_file)
+  for k, courier in couriers.items():
+    row = reader.next()
+    courier.latitude = float(row['latitude'])
+    courier.longitude = float(row['longitude'])
+
+
+def update_statusText():
+
+  if graphics_on:
+    statusText.undraw()
+    statusText.setText(cursor_time_dt.strftime('%H:%M:%S'))
+    statusText.draw(win)
+#  else:
+#    h = round(cursor_time_dt.hour)
+#    if h > round(prev_cursor_time_dt.hour):
+#      print "Hour: :", h
+
+# delete orders impossible to do or with some address out of time range
+def purge_orders():
+
+  orders_to_delete = []
+
+  print "total orders loaded :", len(orders)
+
+  ideal_courier = Courier('0000', day_start_dt, day_start_dt, day_end_dt)
+  timeoutofrange = 0
+  noonecan = 0
+
+  for k, order in orders.items():
+
+    # some order point is out of time range
+    if order.earliest_to_dt() <= day_start_dt or order.latest_from_dt() >= day_end_dt:
+      orders_to_delete.append(k)
+      timeoutofrange += 1
+      continue
+
+    # no way for courier to be on time at every point
+    ideal_courier.latitude = order.route[0]['addr'].latitude
+    ideal_courier.longitude = order.route[0]['addr'].longitude
+    can = ideal_courier.yes_he_can(order.route)
+    if not can[0]:
+      noonecan += 1
+      orders_to_delete.append(k)
+
+  for k in orders_to_delete:
+    orders.pop(k)
+
+  print "orders out of time range :", timeoutofrange
+  print "orders no one can accomplish :", noonecan
+  print "total orders after purge :", len(orders)
+  print "total couriers :", len(couriers)
+
+
+# main code begins
+win = GraphWin("Moscow", 651, 720)
+cityImage = Image(Point(651//2, 720//2), '/users/mike_alexandrovski/downloads/MoscowMapDark.gif')
+cityImage.draw(win)
+statusText = Text(Point(651//2, 10), "Dummy")
+statusText.setTextColor("white")
+statusText.draw(win)
+
+for _, order in orders.items():
+  update_route_durations(order.route)
+
+purge_orders()
+
+early_orders = 0
+for _, order in orders.items():
+  if order.approve_dt <= day_start_dt:
+    early_orders += 1
+print "early orders ", early_orders
+
+early_birds = 0
+for _, courier in couriers.items():
+  if courier.awake_dt <= day_start_dt:
+    early_birds += 1
+print "ealy birds ", early_birds
+
+""" make an order queue sorted by appropriate time """
+# order_queue = sorted([(order_id, orders[order_id].approve_dt) for order_id in orders.keys()], key=lambda tup:tup[1]) # Alg 1
+order_queue = sorted([(order_id, orders[order_id].earliest_from_dt() - timedelta(hours=1)) for order_id in orders.keys()], key=lambda tup:tup[1]) # Alg 2
+
+# assign couriers for the orders timed before 6:00
+for order_id, time_dt in order_queue:
+
+  if time_dt > day_start_dt:
+    break
+
+  order = orders[order_id]
+  courier, best_combo = order.best_courier()
+
+  if courier is None:
+    print "Courier not found for order ", order_id
+  else:
+    courier.assign_route( best_combo)
+    courier.update_on_map()
+#    print order_id, " ", best_combo[0]['dur']
+
+  del orders[order_id]
+
+""" remake an order queue sorted by appropriate time """
+# order_queue = sorted([(order_id, orders[order_id].approve_dt) for order_id in orders.keys()], key=lambda tup:tup[1]) # Alg 1
+order_queue = sorted([(order_id, orders[order_id].earliest_from_dt() - timedelta(hours=1)) for order_id in orders.keys()], key=lambda tup:tup[1]) # Alg 2
+print "orders after 6:00 ", len(order_queue)
+
+""" now real fun begins - couriers start to move around """
+orders_with_no_courier = 0
+for order_id, time_dt in order_queue:
+  time_passed_dt = (time_dt - cursor_time_dt)
+  cursor_time_dt += time_passed_dt
+  update_statusText()
+
+  active_coueriers = 0
+  for _, courier in couriers.items():
+    if len(courier.route) > 0:
+      active_coueriers += 1
+      courier.update_location(time_passed_dt.total_seconds() / 3600)
+
+#  print "active couriers :", active_coueriers
+#  print order_id
+
+  order = orders[order_id]
+  courier, best_combo = order.best_courier()
+
+  if courier is None:
+    print "Courier not found for order ", order_id
+    orders_with_no_courier += 1
+  else:
+    courier.assign_route(best_combo)
+
+  del orders[order_id]
+
+  if cursor_time_dt > dt('2017-10-19 09:00:00'):
+    break
+
+# win.getMouse()  # Pause to view result
+win.close()  # Close window when done
+
+print "Orders with no couriers :", orders_with_no_courier
+
+""" calc total worktime """
+total_worktime = 0.0
+for _, courier in couriers.items():
+  total_worktime += courier.actual_work
+print "Total worktime :", total_worktime
+print "cando saved :", cando_prevent_count
+
+""" more accurate but slower duration calc
+def duration_rad(lat1, lon1, lat2, lon2):
+  return 111.1111 * \
+    degrees(acos(
+        cos(radians(lat1)) * cos(radians(lat2)) * cos(radians(lon1 - lon2)) + sin(radians(lat1)) * sin(radians(lat2))
+    )) / 20.0 + 0.25 # divided by speed 20 km/h and added 15 min time spent at the point
+"""
